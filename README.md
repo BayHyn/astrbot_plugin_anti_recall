@@ -1,9 +1,20 @@
-# helloworld
+<div align="center">
 
-AstrBot 插件模板
+![插件标识](https://count.getloli.com/@astrbot_plugin_anti_recall?name=astrbot_plugin_anti_recall&theme=capoo-2&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
-A template plugin for AstrBot plugin feature
+# astrbot\_plugin\_anti\_recall
 
-# 支持
+**[仅限 aiocqhttp] 防撤回插件**
 
-[帮助文档](https://astrbot.app)
+</div>
+
+## 简介
+
+`astrbot_plugin_anti_recall` 是一个专为 `aiocqhttp` 平台设计的防撤回插件。通过开启监控指定会话，该插件可以将会话内被撤回的消息转发给指定的接收者。
+
+## 功能
+
+- **消息监控**：实时监控指定群组的消息撤回事件。
+- **消息转发**：将撤回的消息转发给指定的用户。
+- **任务管理**：支持添加、删除和查看防撤回任务。
+- **自动清理**：定期清理临时文件，确保插件运行高效。
