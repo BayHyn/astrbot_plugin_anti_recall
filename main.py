@@ -1,9 +1,10 @@
+import asyncio
 import json
 import time
 import pickle
 import threading
 from pathlib import Path
-from .utils import delete_file, get_private_unified_msg_origin
+from .utils import delete_file, delayed_delete, get_private_unified_msg_origin
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 from astrbot.api.star import StarTools
@@ -81,7 +82,7 @@ class AntiRecall(Star):
             file_path = self.temp_path / file_name
             with open(file_path, 'wb') as f:
                 pickle.dump(message, f)
-            threading.Timer(5 * 60, delete_file, args=(file_path,)).start()
+            asyncio.create_task(delayed_delete(5 * 60, file_path))
         elif message_name == 'notice.group_recall':
             file_name = '*_{}_{}.pkl'.format(
                 group_id, message_id

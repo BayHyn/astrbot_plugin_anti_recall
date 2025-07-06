@@ -1,4 +1,5 @@
 import os
+import asyncio
 import traceback
 from astrbot.api import logger
 
@@ -28,3 +29,8 @@ def delete_file(file_path):
             logger.debug(f"[防撤回插件] 文件不存在: {file_path}")
     except Exception as e:
         logger.error(f"[防撤回插件] 删除文件失败 ({file_path}): {traceback.format_exc()}")
+
+
+async def delayed_delete(delay, path):
+    await asyncio.sleep(delay)
+    delete_file(path)
