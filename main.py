@@ -6,14 +6,11 @@ from pathlib import Path
 from .utils import delete_file, get_private_unified_msg_origin
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
+from astrbot.api.star import StarTools
 from astrbot.api import message_components as Comp
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-
-
-TEMP_PATH = Path(__file__).parent / "temp"
-TEMP_PATH.mkdir(exist_ok=True)
 
 
 @register("astrbot_plugin_anti_recall", "JOJO",
@@ -29,8 +26,11 @@ class AntiRecall(Star):
             )
         logger.info('[防撤回插件] 成功加载配置: {}'.format(self.config))
 
+        self.temp_path = Path(StarTools.get_data_dir()) / "anti_recall_cache"
+        self.temp_path.mkdir(exist_ok=True)
+
         # 清理临时目录中的时间戳大于5分钟的文件
-        for file in TEMP_PATH.glob("*.pkl"):
+        for file in self.temp_path.glob("*.pkl"):
             file_create_time = file.name.split('_')[0]
             if time.time() * 1000 - int(file_create_time) > 5 * 60 * 1000:
                 delete_file(file)
@@ -78,7 +78,7 @@ class AntiRecall(Star):
             file_name = '{}_{}_{}.pkl'.format(
                 int(time.time() * 1000), group_id, message_id
             )
-            file_path = TEMP_PATH / file_name
+            file_path = self.temp_path / file_name
             with open(file_path, 'wb') as f:
                 pickle.dump(message, f)
             threading.Timer(5 * 60, delete_file, args=(file_path,)).start()
@@ -86,9 +86,7 @@ class AntiRecall(Star):
             file_name = '*_{}_{}.pkl'.format(
                 group_id, message_id
             )
-            file_path = TEMP_PATH / file_name
-            # 查找匹配的文件
-            file_path = next(TEMP_PATH.glob(file_name), None)
+            file_path = next(self.temp_path.glob(file_name), self.temp_path / file_name)
             if file_path and file_path.exists():
                 with open(file_path, 'rb') as f:
                     message = pickle.load(f)
