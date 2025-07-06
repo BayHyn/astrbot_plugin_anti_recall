@@ -133,9 +133,7 @@ class AntiRecall(Star):
                 "forward_to": user_ids
             })
 
-        self.config["message_forward"] = json.dumps(message_forward, ensure_ascii=False)
         self.config.save_config()
-        self.config['message_forward'] = message_forward
         user_ids = self.get_forward_to_list(group_id)
         yield event.plain_result(
             f"[防撤回插件] 成功添加防撤回任务到群组 {group_id}，剩余接收用户: {','.join(user_ids)}"
@@ -161,9 +159,7 @@ class AntiRecall(Star):
                 break
         else:
             logger.warning(f"[防撤回插件] 未找到群组 {group_id} 的防撤回任务")
-        self.config["message_forward"] = json.dumps(message_forward, ensure_ascii=False)
         self.config.save_config()
-        self.config['message_forward'] = message_forward
         forward_to_list = self.get_forward_to_list(group_id)
         if not forward_to_list:
             # 如果没有接收用户了，删除整个任务
