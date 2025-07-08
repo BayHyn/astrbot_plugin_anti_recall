@@ -2,7 +2,6 @@ import asyncio
 import json
 import time
 import pickle
-import threading
 from pathlib import Path
 from .utils import delete_file, delayed_delete, get_private_unified_msg_origin
 from astrbot.api import logger
