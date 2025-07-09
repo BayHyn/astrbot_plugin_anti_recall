@@ -14,7 +14,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 
 
 @register("astrbot_plugin_anti_recall", "JOJO",
-          "[仅限aiocqhttp] 防撤回插件，开启监控指定会话后，该会话内撤回的消息将转发给指定接收者", "0.0.1")
+          "[仅限aiocqhttp] 防撤回插件，开启监控指定会话后，该会话内撤回的消息将转发给指定接收者", "0.0.2")
 class AntiRecall(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
