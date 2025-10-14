@@ -94,7 +94,7 @@ class AntiRecall(Star):
                 logger.info('[防撤回插件] 用户: {} 在群组 {} 内撤回了消息: {}'.format(user_id, group_id, message))
                 for forward_to in forward_to_list:
                     await self.context.send_message(
-                        get_private_unified_msg_origin(forward_to),
+                        forward_to,
                         MessageChain(
                             [Comp.Plain('用户: {} 在群组 {} 撤回了消息: \n\n'.format(user_id, group_id))] + message
                         )
@@ -116,20 +116,20 @@ class AntiRecall(Star):
         :param group_id: 群组ID
         :param user_list: 用户列表，逗号(,)分隔
         """
-        user_ids = [user.strip() for user in user_list.split(',')]
+        user_sids = [user.strip() for user in user_list.split(',')]
         # 先获取group_id是否存在message_origin中
         message_forward = self.config.get("message_forward", [])
         for task in message_forward:
             if task.get("message_origin") == group_id:
                 # 如果存在，更新forward_to
-                task["forward_to"].extend(user_ids)
+                task["forward_to"].extend(user_sids)
                 task["forward_to"] = list(set(task["forward_to"]))  # 去重
                 break
         else:
             # 如果不存在，添加新的任务
-            message_forward.append({
+            message_forward.append({    
                 "message_origin": group_id,
-                "forward_to": user_ids
+                "forward_to": user_sids
             })
 
         self.config.save_config()

@@ -5,7 +5,7 @@ from astrbot.api import logger
 
 
 def get_private_unified_msg_origin(
-    user_id: str, platform: str = "aiocqhttp"
+    user_sid: str, platform: str = "aiocqhttp"
 ) -> str:
     """获取群组统一消息来源
 
@@ -16,7 +16,7 @@ def get_private_unified_msg_origin(
     Returns:
         str: 统一消息来源
     """
-    return f"{platform}:FriendMessage:{user_id}"
+    return f"{platform}:FriendMessage:{user_sid}"
 
 
 def delete_file(file_path: Path):

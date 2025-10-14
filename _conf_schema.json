@@ -2,7 +2,7 @@
   "message_forward": {
     "type": "string",
     "description": "消息转发列表",
-    "hint": "格式为 JSON 数组，`message_origin`为 群号/用户ID ，`message_target`为 目标群号/用户ID 列表. 例如: [{\"message_origin\":\"123456\",\"forward_to\":[\"654321\",\"10000\"]},{\"message_origin\":\"1234567\",\"forward_to\":[\"6543210\",\"10001\"]}]",
+    "hint": "格式为 JSON 数组，`message_origin`为 群号/用户ID ，`message_target`为 转发目标的sid 列表. 例如: [{\"message_origin\":\"123456\",\"forward_to\":[\"654321\",\"10000\"]},{\"message_origin\":\"1234567\",\"forward_to\":[\"6543210\",\"10001\"]}]",
     "example": "[{\"message_origin\": \"123456789\", \"message_target\": [\"987654321\", \"112233445\"]}]",
     "editor_mode": true,
     "editor_language": "json",
