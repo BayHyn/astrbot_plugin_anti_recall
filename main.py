@@ -36,6 +36,11 @@ class AntiRecall(Star):
         self.max_cache_size = 1000
         self.cache_expire_time = 30 * 60  # 30分钟
 
+        # 待处理撤回队列：当撤回通知比原消息先到时使用
+        # key为 (group_id, message_id)，value为 (timestamp, user_id, forward_to_list)
+        self.pending_recalls = OrderedDict()
+        self.max_pending_recalls = 100  # 最多保存100个待处理撤回
+
         # 清理临时目录中的时间戳大于30分钟的文件
         current_time = time.time() * 1000
         cleaned_count = 0
@@ -125,6 +130,64 @@ class AntiRecall(Star):
         for key in expired_keys:
             del self.message_cache[key]
 
+    def add_pending_recall(self, group_id: str, message_id: str, user_id: str, forward_to_list):
+        """添加待处理撤回通知"""
+        cache_key = (group_id, message_id)
+        current_time = time.time()
+
+        # 如果待处理队列已满，删除最旧的
+        if len(self.pending_recalls) >= self.max_pending_recalls:
+            self.pending_recalls.popitem(last=False)
+
+        # 添加到待处理队列
+        self.pending_recalls[cache_key] = (current_time, user_id, forward_to_list)
+        self.pending_recalls.move_to_end(cache_key)
+
+        logger.info(f'[防撤回插件] 添加待处理撤回通知: group_id={group_id}, message_id={message_id}')
+
+    def process_pending_recall(self, group_id: str, message_id: str, message):
+        """处理待处理的撤回通知"""
+        cache_key = (group_id, message_id)
+
+        if cache_key in self.pending_recalls:
+            timestamp, user_id, forward_to_list = self.pending_recalls[cache_key]
+            del self.pending_recalls[cache_key]
+
+            logger.info(f'[防撤回插件] 处理待处理撤回通知: group_id={group_id}, message_id={message_id}')
+
+            # 立即转发撤回消息
+            for forward_to in forward_to_list:
+                try:
+                    asyncio.create_task(self.context.send_message(
+                        forward_to,
+                        MessageChain(
+                            [Comp.Plain(f'用户: {user_id} 在群组 {group_id} 撤回了消息:\n\n')] + message
+                        )
+                    ))
+                except Exception as e:
+                    logger.error(f'[防撤回插件] 转发消息失败: {e}')
+
+            return True
+        return False
+
+    def clean_expired_pending_recalls(self):
+        """清理过期的待处理撤回通知"""
+        current_time = time.time()
+        expired_keys = []
+        expire_time = 60  # 待处理撤回1分钟后过期
+
+        for cache_key, (timestamp, _, _) in self.pending_recalls.items():
+            if current_time - timestamp > expire_time:
+                expired_keys.append(cache_key)
+            else:
+                # 由于OrderedDict是有序的，遇到第一个未过期的就可以停止了
+                break
+
+        # 删除过期项
+        for key in expired_keys:
+            del self.pending_recalls[key]
+            logger.debug(f'[防撤回插件] 清理过期待处理撤回: group_id={key[0]}, message_id={key[1]}')
+
     def find_message_file(self, group_id: str, message_id: str):
         """查找消息文件，尝试多种匹配方式"""
         # 方法1：精确匹配最近30分钟的文件
@@ -191,6 +254,13 @@ class AntiRecall(Star):
             # 延长文件保存时间到30分钟
             asyncio.create_task(delayed_delete(30 * 60, file_path))
 
+            # 检查是否有待处理的撤回通知
+            if self.process_pending_recall(group_id, message_id, message):
+                logger.info(f'[防撤回插件] 消息到达后立即处理待处理撤回: group_id={group_id}, message_id={message_id}')
+
+            # 定期清理过期的待处理撤回
+            self.clean_expired_pending_recalls()
+
         elif message_name == 'notice.group_recall':
             message = None
             user_id = event.get_sender_id()
@@ -229,10 +299,13 @@ class AntiRecall(Star):
                     except Exception as e:
                         logger.error(f'[防撤回插件] 转发消息失败: {e}')
             else:
-                logger.warning(f'[防撤回插件] 找不到撤回消息的记录: group_id={group_id}, message_id={message_id}')
+                # 如果找不到消息，可能是消息还没到达（乱序），添加到待处理队列
+                logger.info(f'[防撤回插件] 找不到撤回消息的记录，添加到待处理队列: group_id={group_id}, message_id={message_id}')
+                self.add_pending_recall(group_id, message_id, user_id, forward_to_list)
                 # 记录详细的调试信息
                 logger.debug(f'[防撤回插件] 内存缓存中的键: {list(self.message_cache.keys())}')
                 logger.debug(f'[防撤回插件] 缓存目录中的文件: {[f.name for f in self.temp_path.glob("*.pkl")]}')
+                logger.debug(f'[防撤回插件] 待处理撤回队列中的键: {list(self.pending_recalls.keys())}')
 
     @filter.command_group("防撤回", alias={'anti_recall'})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
