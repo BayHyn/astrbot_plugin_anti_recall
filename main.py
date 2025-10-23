@@ -3,6 +3,7 @@ import json
 import time
 import pickle
 from pathlib import Path
+from collections import OrderedDict
 from .utils import delete_file, delayed_delete, get_private_unified_msg_origin
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
@@ -29,12 +30,31 @@ class AntiRecall(Star):
         self.temp_path = Path(StarTools.get_data_dir()) / "anti_recall_cache"
         self.temp_path.mkdir(exist_ok=True)
 
-        # 清理临时目录中的时间戳大于5分钟的文件
+        # 内存缓存：key为 (group_id, message_id)，value为 (timestamp, message_chain)
+        # 使用OrderedDict实现LRU缓存，最多缓存1000条消息
+        self.message_cache = OrderedDict()
+        self.max_cache_size = 1000
+        self.cache_expire_time = 30 * 60  # 30分钟
+
+        # 待处理撤回队列：当撤回通知比原消息先到时使用
+        # key为 (group_id, message_id)，value为 (timestamp, user_id, forward_to_list)
+        self.pending_recalls = OrderedDict()
+        self.max_pending_recalls = 100  # 最多保存100个待处理撤回
+
+        # 清理临时目录中的时间戳大于30分钟的文件
+        current_time = time.time() * 1000
+        cleaned_count = 0
         for file in self.temp_path.glob("*.pkl"):
-            file_create_time = file.name.split('_')[0]
-            if time.time() * 1000 - int(file_create_time) > 5 * 60 * 1000:
+            try:
+                file_create_time = int(file.name.split('_')[0])
+                if current_time - file_create_time > 30 * 60 * 1000:  # 30分钟
+                    delete_file(file)
+                    cleaned_count += 1
+            except (ValueError, IndexError):
+                # 如果文件名格式不正确，也删除
                 delete_file(file)
-        logger.info('[防撤回插件] 清理临时目录完成')
+                cleaned_count += 1
+        logger.info(f'[防撤回插件] 清理临时目录完成，共清理 {cleaned_count} 个过期文件')
         # self.config.save_config()
 
     def get_origin_list(self):
@@ -59,6 +79,152 @@ class AntiRecall(Star):
                 return task.get("forward_to", [])
         return []
 
+    def add_to_cache(self, group_id: str, message_id: str, message):
+        """添加消息到内存缓存"""
+        cache_key = (group_id, message_id)
+        current_time = time.time()
+
+        # 如果缓存已满，删除最旧的消息
+        if len(self.message_cache) >= self.max_cache_size:
+            self.message_cache.popitem(last=False)
+
+        # 添加到缓存
+        self.message_cache[cache_key] = (current_time, message)
+        self.message_cache.move_to_end(cache_key)
+
+        # 清理过期缓存
+        self._clean_expired_cache()
+
+    def get_from_cache(self, group_id: str, message_id: str):
+        """从内存缓存获取消息"""
+        cache_key = (group_id, message_id)
+
+        if cache_key in self.message_cache:
+            timestamp, message = self.message_cache[cache_key]
+            current_time = time.time()
+
+            # 检查是否过期
+            if current_time - timestamp <= self.cache_expire_time:
+                # 移动到末尾（LRU）
+                self.message_cache.move_to_end(cache_key)
+                return message
+            else:
+                # 过期了，删除
+                del self.message_cache[cache_key]
+
+        return None
+
+    def _clean_expired_cache(self):
+        """清理过期的缓存项"""
+        current_time = time.time()
+        expired_keys = []
+
+        for cache_key, (timestamp, _) in self.message_cache.items():
+            if current_time - timestamp > self.cache_expire_time:
+                expired_keys.append(cache_key)
+            else:
+                # 由于OrderedDict是有序的，遇到第一个未过期的就可以停止了
+                break
+
+        # 删除过期项
+        for key in expired_keys:
+            del self.message_cache[key]
+
+    def add_pending_recall(self, group_id: str, message_id: str, user_id: str, forward_to_list):
+        """添加待处理撤回通知"""
+        cache_key = (group_id, message_id)
+        current_time = time.time()
+
+        # 如果待处理队列已满，删除最旧的
+        if len(self.pending_recalls) >= self.max_pending_recalls:
+            self.pending_recalls.popitem(last=False)
+
+        # 添加到待处理队列
+        self.pending_recalls[cache_key] = (current_time, user_id, forward_to_list)
+        self.pending_recalls.move_to_end(cache_key)
+
+        logger.info(f'[防撤回插件] 添加待处理撤回通知: group_id={group_id}, message_id={message_id}')
+
+    def process_pending_recall(self, group_id: str, message_id: str, message):
+        """处理待处理的撤回通知"""
+        cache_key = (group_id, message_id)
+
+        if cache_key in self.pending_recalls:
+            timestamp, user_id, forward_to_list = self.pending_recalls[cache_key]
+            del self.pending_recalls[cache_key]
+
+            logger.info(f'[防撤回插件] 处理待处理撤回通知: group_id={group_id}, message_id={message_id}')
+
+            # 立即转发撤回消息
+            for forward_to in forward_to_list:
+                try:
+                    asyncio.create_task(self.context.send_message(
+                        forward_to,
+                        MessageChain(
+                            [Comp.Plain(f'用户: {user_id} 在群组 {group_id} 撤回了消息:\n\n')] + message
+                        )
+                    ))
+                except Exception as e:
+                    logger.error(f'[防撤回插件] 转发消息失败: {e}')
+
+            return True
+        return False
+
+    def clean_expired_pending_recalls(self):
+        """清理过期的待处理撤回通知"""
+        current_time = time.time()
+        expired_keys = []
+        expire_time = 60  # 待处理撤回1分钟后过期
+
+        for cache_key, (timestamp, _, _) in self.pending_recalls.items():
+            if current_time - timestamp > expire_time:
+                expired_keys.append(cache_key)
+            else:
+                # 由于OrderedDict是有序的，遇到第一个未过期的就可以停止了
+                break
+
+        # 删除过期项
+        for key in expired_keys:
+            del self.pending_recalls[key]
+            logger.debug(f'[防撤回插件] 清理过期待处理撤回: group_id={key[0]}, message_id={key[1]}')
+
+    def find_message_file(self, group_id: str, message_id: str):
+        """查找消息文件，尝试多种匹配方式"""
+        # 方法1：精确匹配最近30分钟的文件
+        current_time = time.time() * 1000
+        time_range = 30 * 60 * 1000  # 30分钟
+
+        # 按时间倒序查找，优先查找最新的文件
+        matching_files = []
+        for file in self.temp_path.glob("*.pkl"):
+            try:
+                parts = file.name.split('_')
+                if len(parts) >= 3:
+                    file_time = int(parts[0])
+                    file_group = parts[1]
+                    file_msg_id = parts[2].replace('.pkl', '')
+
+                    # 检查是否在时间范围内且匹配group_id和message_id
+                    if (current_time - file_time <= time_range and
+                        file_group == group_id and
+                        file_msg_id == message_id):
+                        matching_files.append((file_time, file))
+            except (ValueError, IndexError):
+                continue
+
+        # 如果找到多个匹配的文件，返回最新的那个
+        if matching_files:
+            matching_files.sort(reverse=True)  # 按时间倒序
+            return matching_files[0][1]  # 返回最新的文件
+
+        # 方法2：使用通配符匹配（兼容旧版本）
+        pattern = f"*_{group_id}_{message_id}.pkl"
+        files = list(self.temp_path.glob(pattern))
+        if files:
+            return files[0]
+
+        return None
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_all_message(self, event: AstrMessageEvent):
@@ -75,32 +241,71 @@ class AntiRecall(Star):
 
         if message_name == 'message.group.normal':
             message = event.get_messages()
+
+            # 同时保存到内存缓存和文件
+            self.add_to_cache(group_id, message_id, message)
+
             file_name = '{}_{}_{}.pkl'.format(
                 int(time.time() * 1000), group_id, message_id
             )
             file_path = self.temp_path / file_name
             with open(file_path, 'wb') as f:
                 pickle.dump(message, f)
-            asyncio.create_task(delayed_delete(5 * 60, file_path))
+            # 延长文件保存时间到30分钟
+            asyncio.create_task(delayed_delete(30 * 60, file_path))
+
+            # 检查是否有待处理的撤回通知
+            if self.process_pending_recall(group_id, message_id, message):
+                logger.info(f'[防撤回插件] 消息到达后立即处理待处理撤回: group_id={group_id}, message_id={message_id}')
+
+            # 定期清理过期的待处理撤回
+            self.clean_expired_pending_recalls()
+
         elif message_name == 'notice.group_recall':
-            file_name = '*_{}_{}.pkl'.format(
-                group_id, message_id
-            )
-            file_path = next(self.temp_path.glob(file_name), self.temp_path / file_name)
-            if file_path and file_path.exists():
-                with open(file_path, 'rb') as f:
-                    message = pickle.load(f)
-                user_id = event.get_sender_id()
-                logger.info('[防撤回插件] 用户: {} 在群组 {} 内撤回了消息: {}'.format(user_id, group_id, message))
-                for forward_to in forward_to_list:
-                    await self.context.send_message(
-                        get_private_unified_msg_origin(forward_to),
-                        MessageChain(
-                            [Comp.Plain('用户: {} 在群组 {} 撤回了消息: \n\n'.format(user_id, group_id))] + message
-                        )
-                    )
+            message = None
+            user_id = event.get_sender_id()
+
+            # 首先尝试从内存缓存获取
+            message = self.get_from_cache(group_id, message_id)
+            found_in_cache = message is not None
+
+            # 如果内存缓存中没有，尝试从文件获取
+            if message is None:
+                file_path = self.find_message_file(group_id, message_id)
+                if file_path and file_path.exists():
+                    try:
+                        with open(file_path, 'rb') as f:
+                            message = pickle.load(f)
+                        found_in_file = True
+                    except Exception as e:
+                        logger.error(f'[防撤回插件] 读取消息文件失败: {e}')
+                        message = None
+                else:
+                    found_in_file = False
             else:
-                logger.warning('[防撤回插件] 找不到撤回消息的记录: {}'.format(file_name))
+                found_in_file = False
+
+            if message:
+                source = "内存缓存" if found_in_cache else "文件缓存"
+                logger.info(f'[防撤回插件] 用户: {user_id} 在群组 {group_id} 内撤回了消息 (来源: {source}): {message}')
+                for forward_to in forward_to_list:
+                    try:
+                        await self.context.send_message(
+                            forward_to,
+                            MessageChain(
+                                [Comp.Plain(f'用户: {user_id} 在群组 {group_id} 撤回了消息:\n\n')] + message
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f'[防撤回插件] 转发消息失败: {e}')
+            else:
+                # 如果找不到消息，可能是消息还没到达（乱序），添加到待处理队列
+                logger.info(f'[防撤回插件] 找不到撤回消息的记录，添加到待处理队列: group_id={group_id}, message_id={message_id}')
+                self.add_pending_recall(group_id, message_id, user_id, forward_to_list)
+                # 记录详细的调试信息
+                logger.debug(f'[防撤回插件] 内存缓存中的键: {list(self.message_cache.keys())}')
+                logger.debug(f'[防撤回插件] 缓存目录中的文件: {[f.name for f in self.temp_path.glob("*.pkl")]}')
+                logger.debug(f'[防撤回插件] 待处理撤回队列中的键: {list(self.pending_recalls.keys())}')
 
     @filter.command_group("防撤回", alias={'anti_recall'})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
@@ -116,20 +321,20 @@ class AntiRecall(Star):
         :param group_id: 群组ID
         :param user_list: 用户列表，逗号(,)分隔
         """
-        user_ids = [user.strip() for user in user_list.split(',')]
+        user_sids = [user.strip() for user in user_list.split(',')]
         # 先获取group_id是否存在message_origin中
         message_forward = self.config.get("message_forward", [])
         for task in message_forward:
             if task.get("message_origin") == group_id:
                 # 如果存在，更新forward_to
-                task["forward_to"].extend(user_ids)
+                task["forward_to"].extend(user_sids)
                 task["forward_to"] = list(set(task["forward_to"]))  # 去重
                 break
         else:
             # 如果不存在，添加新的任务
-            message_forward.append({
+            message_forward.append({    
                 "message_origin": group_id,
-                "forward_to": user_ids
+                "forward_to": user_sids
             })
 
         self.config.save_config()
