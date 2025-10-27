@@ -1,21 +1,23 @@
+# main.py
+
 import asyncio
 import json
 import time
 import pickle
 from pathlib import Path
 from collections import OrderedDict
-from .utils import delete_file, delayed_delete, get_private_unified_msg_origin
+from .utils import delete_file, delayed_delete
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 from astrbot.api.star import StarTools
 from astrbot.api import message_components as Comp
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 @register("astrbot_plugin_anti_recall", "JOJO",
-          "[仅限aiocqhttp] 防撤回插件，开启监控指定会话后，该会话内撤回的消息将转发给指定接收者", "0.0.2")
+          "[仅限aiocqhttp] 防撤回插件，开启监控指定会话后，该会话内撤回的消息将转发给指定接收者", "0.0.5")
 class AntiRecall(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -30,282 +32,276 @@ class AntiRecall(Star):
         self.temp_path = Path(StarTools.get_data_dir()) / "anti_recall_cache"
         self.temp_path.mkdir(exist_ok=True)
 
-        # 内存缓存：key为 (group_id, message_id)，value为 (timestamp, message_chain)
-        # 使用OrderedDict实现LRU缓存，最多缓存1000条消息
         self.message_cache = OrderedDict()
         self.max_cache_size = 1000
-        self.cache_expire_time = 30 * 60  # 30分钟
+        self.cache_expire_time = 30 * 60
 
-        # 待处理撤回队列：当撤回通知比原消息先到时使用
-        # key为 (group_id, message_id)，value为 (timestamp, user_id, forward_to_list)
         self.pending_recalls = OrderedDict()
-        self.max_pending_recalls = 100  # 最多保存100个待处理撤回
+        self.max_pending_recalls = 100
 
-        # 清理临时目录中的时间戳大于30分钟的文件
         current_time = time.time() * 1000
         cleaned_count = 0
         for file in self.temp_path.glob("*.pkl"):
             try:
                 file_create_time = int(file.name.split('_')[0])
-                if current_time - file_create_time > 30 * 60 * 1000:  # 30分钟
+                if current_time - file_create_time > self.cache_expire_time * 1000:
                     delete_file(file)
                     cleaned_count += 1
             except (ValueError, IndexError):
-                # 如果文件名格式不正确，也删除
                 delete_file(file)
                 cleaned_count += 1
         logger.info(f'[防撤回插件] 清理临时目录完成，共清理 {cleaned_count} 个过期文件')
-        # self.config.save_config()
 
     def get_origin_list(self):
-        """获取配置中的消息转发任务列表"""
         message_forward = self.config.get("message_forward", [])
-        origin_list = []
-        for task in message_forward:
-            if not isinstance(task, dict):
-                logger.warning(f"[防撤回插件] 配置中的任务格式错误: {task}")
-                continue
-            if "message_origin" not in task or "forward_to" not in task:
-                logger.warning(f"[防撤回插件] 配置中的任务缺少必要字段: {task}")
-                continue
-            origin_list.append(task.get("message_origin"))
-        return origin_list
+        return [task.get("message_origin") for task in message_forward if isinstance(task, dict) and "message_origin" in task]
 
     def get_forward_to_list(self, group_id: str):
-        """获取指定群组的转发目标列表"""
         message_forward = self.config.get("message_forward", [])
         for task in message_forward:
-            if task.get("message_origin") == group_id:
+            if isinstance(task, dict) and task.get("message_origin") == group_id:
                 return task.get("forward_to", [])
         return []
 
     def add_to_cache(self, group_id: str, message_id: str, message):
-        """添加消息到内存缓存"""
         cache_key = (group_id, message_id)
         current_time = time.time()
-
-        # 如果缓存已满，删除最旧的消息
+        logger.info(f"[防撤回|CACHE] ADD: key={cache_key}, content_len={len(message) if message is not None else 'N/A'}")
         if len(self.message_cache) >= self.max_cache_size:
             self.message_cache.popitem(last=False)
-
-        # 添加到缓存
         self.message_cache[cache_key] = (current_time, message)
         self.message_cache.move_to_end(cache_key)
-
-        # 清理过期缓存
         self._clean_expired_cache()
 
     def get_from_cache(self, group_id: str, message_id: str):
-        """从内存缓存获取消息"""
         cache_key = (group_id, message_id)
-
         if cache_key in self.message_cache:
             timestamp, message = self.message_cache[cache_key]
             current_time = time.time()
-
-            # 检查是否过期
             if current_time - timestamp <= self.cache_expire_time:
-                # 移动到末尾（LRU）
                 self.message_cache.move_to_end(cache_key)
                 return message
             else:
-                # 过期了，删除
                 del self.message_cache[cache_key]
-
         return None
 
     def _clean_expired_cache(self):
-        """清理过期的缓存项"""
         current_time = time.time()
-        expired_keys = []
-
-        for cache_key, (timestamp, _) in self.message_cache.items():
-            if current_time - timestamp > self.cache_expire_time:
-                expired_keys.append(cache_key)
-            else:
-                # 由于OrderedDict是有序的，遇到第一个未过期的就可以停止了
-                break
-
-        # 删除过期项
+        expired_keys = [key for key, (timestamp, _) in self.message_cache.items() if current_time - timestamp > self.cache_expire_time]
         for key in expired_keys:
-            del self.message_cache[key]
+            if key in self.message_cache:
+                del self.message_cache[key]
 
     def add_pending_recall(self, group_id: str, message_id: str, user_id: str, forward_to_list):
-        """添加待处理撤回通知"""
         cache_key = (group_id, message_id)
         current_time = time.time()
-
-        # 如果待处理队列已满，删除最旧的
         if len(self.pending_recalls) >= self.max_pending_recalls:
             self.pending_recalls.popitem(last=False)
-
-        # 添加到待处理队列
         self.pending_recalls[cache_key] = (current_time, user_id, forward_to_list)
         self.pending_recalls.move_to_end(cache_key)
-
         logger.info(f'[防撤回插件] 添加待处理撤回通知: group_id={group_id}, message_id={message_id}')
 
-    def process_pending_recall(self, group_id: str, message_id: str, message):
-        """处理待处理的撤回通知"""
-        cache_key = (group_id, message_id)
-
-        if cache_key in self.pending_recalls:
-            timestamp, user_id, forward_to_list = self.pending_recalls[cache_key]
-            del self.pending_recalls[cache_key]
-
-            logger.info(f'[防撤回插件] 处理待处理撤回通知: group_id={group_id}, message_id={message_id}')
-
-            # 立即转发撤回消息
-            for forward_to in forward_to_list:
-                try:
-                    asyncio.create_task(self.context.send_message(
-                        forward_to,
-                        MessageChain(
-                            [Comp.Plain(f'用户: {user_id} 在群组 {group_id} 撤回了消息:\n\n')] + message
-                        )
-                    ))
-                except Exception as e:
-                    logger.error(f'[防撤回插件] 转发消息失败: {e}')
-
-            return True
-        return False
-
     def clean_expired_pending_recalls(self):
-        """清理过期的待处理撤回通知"""
         current_time = time.time()
-        expired_keys = []
-        expire_time = 60  # 待处理撤回1分钟后过期
-
-        for cache_key, (timestamp, _, _) in self.pending_recalls.items():
-            if current_time - timestamp > expire_time:
-                expired_keys.append(cache_key)
-            else:
-                # 由于OrderedDict是有序的，遇到第一个未过期的就可以停止了
-                break
-
-        # 删除过期项
+        expire_time = 60
+        expired_keys = [key for key, (timestamp, _, _) in self.pending_recalls.items() if current_time - timestamp > expire_time]
         for key in expired_keys:
-            del self.pending_recalls[key]
-            logger.debug(f'[防撤回插件] 清理过期待处理撤回: group_id={key[0]}, message_id={key[1]}')
+            if key in self.pending_recalls:
+                del self.pending_recalls[key]
 
     def find_message_file(self, group_id: str, message_id: str):
-        """查找消息文件，尝试多种匹配方式"""
-        # 方法1：精确匹配最近30分钟的文件
         current_time = time.time() * 1000
-        time_range = 30 * 60 * 1000  # 30分钟
-
-        # 按时间倒序查找，优先查找最新的文件
+        time_range = self.cache_expire_time * 1000
         matching_files = []
-        for file in self.temp_path.glob("*.pkl"):
+        for file in self.temp_path.glob(f"*_{group_id}_{message_id}.pkl"):
             try:
-                parts = file.name.split('_')
-                if len(parts) >= 3:
-                    file_time = int(parts[0])
-                    file_group = parts[1]
-                    file_msg_id = parts[2].replace('.pkl', '')
-
-                    # 检查是否在时间范围内且匹配group_id和message_id
-                    if (current_time - file_time <= time_range and
-                        file_group == group_id and
-                        file_msg_id == message_id):
-                        matching_files.append((file_time, file))
+                file_time = int(file.name.split('_')[0])
+                if current_time - file_time <= time_range:
+                    matching_files.append((file_time, file))
             except (ValueError, IndexError):
                 continue
-
-        # 如果找到多个匹配的文件，返回最新的那个
         if matching_files:
-            matching_files.sort(reverse=True)  # 按时间倒序
-            return matching_files[0][1]  # 返回最新的文件
-
-        # 方法2：使用通配符匹配（兼容旧版本）
-        pattern = f"*_{group_id}_{message_id}.pkl"
-        files = list(self.temp_path.glob(pattern))
-        if files:
-            return files[0]
-
+            matching_files.sort(reverse=True)
+            return matching_files[0][1]
         return None
+
+    def _parse_onebot_segment(self, segment: dict):
+        seg_type = segment.get("type")
+        data = segment.get("data", {})
+        if seg_type == "text": return Comp.Plain(data.get("text", ""))
+        if seg_type == "image": return Comp.Image.fromURL(data.get("url", ""))
+        if seg_type == "at": return Comp.At(qq=data.get("qq", ""))
+        if seg_type == "face": return Comp.Face(id=int(data.get("id", 0)))
+        if seg_type == "reply": return Comp.Reply(id=data.get("id", ""))
+        return None
+
+    def _parse_raw_nodes_to_astrbot_nodes(self, raw_nodes: list) -> list[Comp.Node]:
+        astrbot_nodes = []
+        for node in raw_nodes:
+            sender_id = node.get("sender", {}).get("user_id")
+            sender_name = node.get("sender", {}).get("nickname")
+            content_chain = []
+            
+            # 关键修复: 从 "message" 键获取内容, 而不是 "content"
+            raw_content = node.get("message", [])
+            
+            if isinstance(raw_content, str):
+                content_chain.append(Comp.Plain(raw_content))
+            elif isinstance(raw_content, list):
+                for segment in raw_content:
+                    comp = self._parse_onebot_segment(segment)
+                    if comp: content_chain.append(comp)
+            astrbot_nodes.append(Comp.Node(uin=sender_id, name=sender_name, content=content_chain))
+        return astrbot_nodes
+    
+    def _convert_astrbot_component_to_raw(self, component) -> dict:
+        if isinstance(component, Comp.Plain):
+            return {"type": "text", "data": {"text": component.text}}
+        if isinstance(component, Comp.Image):
+            return {"type": "image", "data": {"file": component.url}}
+        if isinstance(component, Comp.At):
+            return {"type": "at", "data": {"qq": str(component.qq)}}
+        if isinstance(component, Comp.Face):
+            return {"type": "face", "data": {"id": str(component.id)}}
+        if isinstance(component, Comp.Reply):
+            return {"type": "reply", "data": {"id": str(component.id)}}
+        return {}
+
+    def _convert_astrbot_nodes_to_raw(self, astrbot_nodes: list[Comp.Node]) -> list[dict]:
+        raw_nodes = []
+        for node in astrbot_nodes:
+            raw_content = [self._convert_astrbot_component_to_raw(comp) for comp in node.content]
+            raw_nodes.append({
+                "type": "node",
+                "data": {
+                    "user_id": str(node.uin),
+                    "nickname": node.name,
+                    # 发送时使用 "content" 键
+                    "content": [c for c in raw_content if c]
+                }
+            })
+        return raw_nodes
+
+    async def _send_recall_notification(self, user_id: str, group_id: str, recalled_content: list, forward_to_list: list, bot_id: str):
+        is_forward_content = recalled_content is not None and all(isinstance(comp, Comp.Node) for comp in recalled_content)
+
+        if not is_forward_content:
+            final_message_chain = [Comp.Plain(f'用户: {user_id} 在群组 {group_id} 撤回了消息:\n\n')] + (recalled_content or [])
+            for forward_to in forward_to_list:
+                try:
+                    await self.context.send_message(forward_to, MessageChain(chain=final_message_chain))
+                except Exception as e:
+                    logger.error(f'[防撤回插件] 转发普通消息失败 to {forward_to}: {e}')
+            return
+
+        platform = self.context.get_platform(filter.PlatformAdapterType.AIOCQHTTP)
+        if not platform:
+            logger.error("[防撤回插件] 无法获取 aiocqhttp 平台实例。")
+            return
+        
+        client = platform.get_client()
+        if not client:
+            logger.error("[防撤回插件] 无法从平台实例获取客户端。")
+            return
+
+        notification_node = Comp.Node(
+            uin=bot_id, name="防撤回通知",
+            content=[Comp.Plain(f"用户 {user_id} 在群 {group_id} 撤回了合并转发消息:")]
+        )
+        final_nodes_astrbot = [notification_node] + recalled_content
+        final_nodes_raw = self._convert_astrbot_nodes_to_raw(final_nodes_astrbot)
+        
+        for forward_to_umo in forward_to_list:
+            try:
+                parts = forward_to_umo.split(':')
+                if len(parts) != 3: continue
+                
+                target_type = parts[1]
+                target_id = int(parts[2])
+
+                if target_type == "GroupMessage":
+                    await client.api.call_action('send_group_forward_msg', group_id=target_id, messages=final_nodes_raw)
+                    logger.info(f"[防撤回|SEND] 成功发送合并转发到群聊: {target_id}")
+                elif target_type == "FriendMessage":
+                    await client.api.call_action('send_private_forward_msg', user_id=target_id, messages=final_nodes_raw)
+                    logger.info(f"[防撤回|SEND] 成功发送合并转发到好友: {target_id}")
+
+            except Exception as e:
+                logger.error(f'[防撤回插件] 通过底层API转发合并消息失败 to {forward_to_umo}: {e}')
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_all_message(self, event: AstrMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent): return
+
         raw_message = event.message_obj.raw_message
         group_id = event.get_group_id()
-        message_id = raw_message.message_id
+        if not group_id or group_id not in self.get_origin_list():
+            return
+        
         message_name = raw_message.name
 
-        origin_list = self.get_origin_list()
-        forward_to_list = self.get_forward_to_list(group_id)
-        if group_id not in origin_list:
-            logger.debug(f"[防撤回插件] 群组 {group_id} 不在监控列表中，跳过处理")
-            return
-
         if message_name == 'message.group.normal':
-            message = event.get_messages()
+            message_id = str(raw_message.message_id)
+            message_to_cache = event.get_messages()
 
-            # 同时保存到内存缓存和文件
-            self.add_to_cache(group_id, message_id, message)
-
-            file_name = '{}_{}_{}.pkl'.format(
-                int(time.time() * 1000), group_id, message_id
-            )
+            if message_to_cache and isinstance(message_to_cache[0], Comp.Forward):
+                forward_id = message_to_cache[0].id
+                client = event.bot
+                try:
+                    raw_forward_content = await client.api.call_action('get_forward_msg', id=forward_id)
+                    if raw_forward_content and 'messages' in raw_forward_content:
+                        message_to_cache = self._parse_raw_nodes_to_astrbot_nodes(raw_forward_content['messages'])
+                        logger.info(f"[防撤回插件] 成功主动缓存合并转发消息内容 Group({group_id}) MsgID({message_id})")
+                    else:
+                        logger.warning(f"[防撤回插件] 主动获取合并转发消息 ({forward_id}) 内容失败，API未返回有效数据。")
+                except Exception as e:
+                    logger.error(f"[防撤回插件] 主动获取合并转发消息 ({forward_id}) 内容时出错: {e}")
+            
+            self.add_to_cache(group_id, message_id, message_to_cache)
+            file_name = f'{int(time.time() * 1000)}_{group_id}_{message_id}.pkl'
             file_path = self.temp_path / file_name
-            with open(file_path, 'wb') as f:
-                pickle.dump(message, f)
-            # 延长文件保存时间到30分钟
-            asyncio.create_task(delayed_delete(30 * 60, file_path))
+            try:
+                with open(file_path, 'wb') as f: pickle.dump(message_to_cache, f)
+                asyncio.create_task(delayed_delete(self.cache_expire_time, file_path))
+            except Exception as e:
+                logger.error(f"[防撤回插件] 写入缓存文件失败: {e}")
 
-            # 检查是否有待处理的撤回通知
-            if self.process_pending_recall(group_id, message_id, message):
+            cache_key = (group_id, message_id)
+            if cache_key in self.pending_recalls:
+                _, user_id, forward_to_list = self.pending_recalls.pop(cache_key)
                 logger.info(f'[防撤回插件] 消息到达后立即处理待处理撤回: group_id={group_id}, message_id={message_id}')
-
-            # 定期清理过期的待处理撤回
+                await self._send_recall_notification(user_id, group_id, message_to_cache, forward_to_list, event.message_obj.self_id)
+            
             self.clean_expired_pending_recalls()
 
         elif message_name == 'notice.group_recall':
-            message = None
-            user_id = event.get_sender_id()
+            recalled_message_id = str(raw_message.message_id)
+            user_id = str(raw_message.user_id)
+            forward_to_list = self.get_forward_to_list(group_id)
 
-            # 首先尝试从内存缓存获取
-            message = self.get_from_cache(group_id, message_id)
-            found_in_cache = message is not None
-
-            # 如果内存缓存中没有，尝试从文件获取
-            if message is None:
-                file_path = self.find_message_file(group_id, message_id)
+            message_content = self.get_from_cache(group_id, recalled_message_id)
+            
+            if message_content is not None:
+                source = "内存缓存"
+                logger.info(f'[防撤回插件] 用户: {user_id} 在群组 {group_id} 内撤回了消息 (来源: {source})')
+                await self._send_recall_notification(user_id, group_id, message_content, forward_to_list, event.message_obj.self_id)
+            else:
+                message_content_from_file = None
+                file_path = self.find_message_file(group_id, recalled_message_id)
                 if file_path and file_path.exists():
                     try:
-                        with open(file_path, 'rb') as f:
-                            message = pickle.load(f)
-                        found_in_file = True
+                        with open(file_path, 'rb') as f: message_content_from_file = pickle.load(f)
                     except Exception as e:
                         logger.error(f'[防撤回插件] 读取消息文件失败: {e}')
-                        message = None
+                
+                if message_content_from_file is not None:
+                    source = "文件缓存"
+                    logger.info(f'[防撤回插件] 用户: {user_id} 在群组 {group_id} 内撤回了消息 (来源: {source})')
+                    await self._send_recall_notification(user_id, group_id, message_content_from_file, forward_to_list, event.message_obj.self_id)
                 else:
-                    found_in_file = False
-            else:
-                found_in_file = False
-
-            if message:
-                source = "内存缓存" if found_in_cache else "文件缓存"
-                logger.info(f'[防撤回插件] 用户: {user_id} 在群组 {group_id} 内撤回了消息 (来源: {source}): {message}')
-                for forward_to in forward_to_list:
-                    try:
-                        await self.context.send_message(
-                            forward_to,
-                            MessageChain(
-                                [Comp.Plain(f'用户: {user_id} 在群组 {group_id} 撤回了消息:\n\n')] + message
-                            )
-                        )
-                    except Exception as e:
-                        logger.error(f'[防撤回插件] 转发消息失败: {e}')
-            else:
-                # 如果找不到消息，可能是消息还没到达（乱序），添加到待处理队列
-                logger.info(f'[防撤回插件] 找不到撤回消息的记录，添加到待处理队列: group_id={group_id}, message_id={message_id}')
-                self.add_pending_recall(group_id, message_id, user_id, forward_to_list)
-                # 记录详细的调试信息
-                logger.debug(f'[防撤回插件] 内存缓存中的键: {list(self.message_cache.keys())}')
-                logger.debug(f'[防撤回插件] 缓存目录中的文件: {[f.name for f in self.temp_path.glob("*.pkl")]}')
-                logger.debug(f'[防撤回插件] 待处理撤回队列中的键: {list(self.pending_recalls.keys())}')
+                    logger.info(f'[防撤回插件] 内存和文件中均找不到撤回消息的记录，添加到待处理队列: group_id={group_id}, message_id={recalled_message_id}')
+                    self.add_pending_recall(group_id, recalled_message_id, user_id, forward_to_list)
 
     @filter.command_group("防撤回", alias={'anti_recall'})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
@@ -315,81 +311,70 @@ class AntiRecall(Star):
     @anti_recall.command("增加", alias={'添加', 'add'})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def add_anti_recall_task(self, event: AstrMessageEvent, group_id: str, user_list: str):
-        """
-        添加防撤回任务(为避免风控，建议不要添加过多用户)
-        :param event: AstrMessageEvent
-        :param group_id: 群组ID
-        :param user_list: 用户列表，逗号(,)分隔
-        """
         user_sids = [user.strip() for user in user_list.split(',')]
-        # 先获取group_id是否存在message_origin中
         message_forward = self.config.get("message_forward", [])
+        task_found = False
         for task in message_forward:
             if task.get("message_origin") == group_id:
-                # 如果存在，更新forward_to
-                task["forward_to"].extend(user_sids)
-                task["forward_to"] = list(set(task["forward_to"]))  # 去重
+                task_found = True
+                existing_users = set(task.get("forward_to", []))
+                existing_users.update(user_sids)
+                task["forward_to"] = sorted(list(existing_users))
                 break
-        else:
-            # 如果不存在，添加新的任务
-            message_forward.append({    
+        if not task_found:
+            message_forward.append({
                 "message_origin": group_id,
-                "forward_to": user_sids
+                "forward_to": sorted(list(set(user_sids)))
             })
-
+        self.config["message_forward"] = message_forward
         self.config.save_config()
-        user_ids = self.get_forward_to_list(group_id)
+        current_users = self.get_forward_to_list(group_id)
         yield event.plain_result(
-            f"[防撤回插件] 成功添加防撤回任务到群组 {group_id}，剩余接收用户: {','.join(user_ids)}"
+            f"[防撤回插件] 成功更新群组 {group_id} 的防撤回任务。\n当前接收用户: {','.join(current_users)}"
         )
 
     @anti_recall.command("删除", alias={'移除', 'remove', 'rm', 'delete', 'del'})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def remove_anti_recall_task(self, event: AstrMessageEvent, group_id: str, user_list: str):
-        """
-        删除防撤回任务
-        :param event: AstrMessageEvent
-        :param group_id: 群组ID
-        :param user_list: 用户列表，逗号(,)分隔
-        """
-        user_ids = [user.strip() for user in user_list.split(',')]
+        user_ids_to_remove = {user.strip() for user in user_list.split(',')}
         message_forward = self.config.get("message_forward", [])
+        task_found = False
         for task in message_forward:
             if task.get("message_origin") == group_id:
-                # 如果存在，删除forward_to中的用户
-                task["forward_to"] = [user for user in task["forward_to"] if user not in user_ids]
-                if not task["forward_to"]:
+                task_found = True
+                current_users = set(task.get("forward_to", []))
+                current_users -= user_ids_to_remove
+                if not current_users:
                     message_forward.remove(task)
+                else:
+                    task["forward_to"] = sorted(list(current_users))
                 break
-        else:
-            logger.warning(f"[防撤回插件] 未找到群组 {group_id} 的防撤回任务")
+        if not task_found:
+            yield event.plain_result(f"[防撤回插件] 未找到群组 {group_id} 的防撤回任务。")
+            return
+        
+        self.config["message_forward"] = message_forward
         self.config.save_config()
-        forward_to_list = self.get_forward_to_list(group_id)
-        if not forward_to_list:
-            # 如果没有接收用户了，删除整个任务
-            yield event.plain_result(
-                f"[防撤回插件] 成功从群组 {group_id} 删除防撤回任务，接收用户已全部移除"
-            )
+        
+        remaining_users = self.get_forward_to_list(group_id)
+        if not remaining_users:
+            yield event.plain_result(f"[防撤回插件] 已从群组 {group_id} 中移除指定用户，该群组监控任务已删除。")
         else:
             yield event.plain_result(
-                f"[防撤回插件] 成功从群组 {group_id} 删除防撤回任务，接收用户: {', '.join(forward_to_list)}"
+                f"[防撤回插件] 已从群组 {group_id} 中移除指定用户。\n剩余接收用户: {','.join(remaining_users)}"
             )
 
     @anti_recall.command("查看", alias={'list', 'show', 'ls'})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def list_anti_recall_tasks(self, event: AstrMessageEvent):
-        """
-        查看当前防撤回任务列表
-        :param event: AstrMessageEvent
-        """
         message_forward = self.config.get("message_forward", [])
         if not message_forward:
-            yield event.plain_result("[防撤回插件] 当前没有任何防撤回任务")
+            yield event.plain_result("[防撤回插件] 当前没有任何防撤回任务。")
             return
 
         result = "[防撤回插件] 当前防撤回任务列表:\n"
-        for task in message_forward:
+        for i, task in enumerate(message_forward):
             group_id = task.get("message_origin")
             forward_to = task.get("forward_to", [])
-            result += f"群组ID: {group_id}, 接收用户: {','.join(forward_to)}\n"
-        yield event.plain_result(result)
+            result += f"任务{i+1}: 群组ID: {group_id}\n  接收用户: {','.join(forward_to)}\n"
+        yield event.plain_result(result.strip())
