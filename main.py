@@ -66,7 +66,7 @@ class AntiRecall(Star):
     def add_to_cache(self, group_id: str, message_id: str, message):
         cache_key = (group_id, message_id)
         current_time = time.time()
-        logger.info(f"[防撤回|CACHE] ADD: key={cache_key}, content_len={len(message) if message is not None else 'N/A'}")
+        logger.debug(f"[防撤回|CACHE] ADD: key={cache_key}, content_len={len(message) if message is not None else 'N/A'}")
         if len(self.message_cache) >= self.max_cache_size:
             self.message_cache.popitem(last=False)
         self.message_cache[cache_key] = (current_time, message)
@@ -252,7 +252,7 @@ class AntiRecall(Star):
                     raw_forward_content = await client.api.call_action('get_forward_msg', id=forward_id)
                     if raw_forward_content and 'messages' in raw_forward_content:
                         message_to_cache = self._parse_raw_nodes_to_astrbot_nodes(raw_forward_content['messages'])
-                        logger.info(f"[防撤回插件] 成功主动缓存合并转发消息内容 Group({group_id}) MsgID({message_id})")
+                        logger.debug(f"[防撤回插件] 成功主动缓存合并转发消息内容 Group({group_id}) MsgID({message_id})")
                     else:
                         logger.warning(f"[防撤回插件] 主动获取合并转发消息 ({forward_id}) 内容失败，API未返回有效数据。")
                 except Exception as e:
